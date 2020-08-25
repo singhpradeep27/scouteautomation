@@ -1,0 +1,252 @@
+pipeline {
+    agent dockerfile true
+    stages {
+        stage('Back-end') {
+            agent {
+                docker { image 'scoutsuite:latest ' }
+            }
+            steps {
+                docker run --rm -t -v ~/.aws:/root/.aws:ro -v "$(pwd)/results:/opt/scoutsuite-report" scoutsuite:latest aws
+            }
+        }
+        stage('Front-end') {
+            agent {
+                echo test
+            }
+            steps {
+                sh 'node --version'
+            }
+        }
+    }
+}
+
+==============================
+
+
+
+//CI
+
+def SCRIPT_VERSION="1.0.0-rc5"
+
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import java.text.SimpleDateFormat
+def dateFormat = new SimpleDateFormat("yyyy-MM-dd-HH-mm")
+rel_tag = dateFormat.format(new Date())
+def git_branch = ""
+
+// Extract TAG information
+//def GIT_TAG_NAME = ""
+//if ("${ref_type}" == "tag") { GIT_TAG_NAME = ref.tokenize("/")[-1] }
+
+// Docker image variable
+def DOCKER_IMAGE_URI = ""
+
+
+parameters {
+    string(name: 'AWS_ACCESS_KEY_ID', defaultValue: 'false', description: 'Certificate credential id for cert file')
+    string(name: 'AWS_SECRET_ACCESS_KEY', defaultValue: 'false', description: 'Certificate credential id for cert file')
+    string(name: 'Default_region_name', defaultValue: 'us-east-1', description: 'Certificate credential id for cert file')
+}
+
+// Force lower case for all values used to construct the docker image URL
+string CLIENT_NAME = CLIENT_NAME.toLowerCase()
+string CONTAINER_IMAGE_REPOSITORY = CONTAINER_IMAGE_REPOSITORY.toLowerCase()
+string NAME = name.toLowerCase()
+
+// Force lower case for the tag
+string rel_tag = rel_tag.toLowerCase()
+
+// Image URL creation based on GitHub values
+def IMAGE_URL = "${CONTAINER_IMAGE_REPOSITORY}/${CLIENT_NAME}/${NAME}"
+
+// Docker login function
+//def dockerRegistryLogin() {
+    echo "Docker registry login"
+    sh '''
+        set +x
+        sudo $(aws ecr get-login --no-include-email --region us-east-1)
+        set -x
+        '''
+}
+
+// Email notification function
+def notifyViaEmail(String buildStatus = 'SUCCESS', String MESSAGE = 'Report') {
+    def decodedJobName = env.JOB_NAME.replaceAll("%2F", "/")
+
+    emailext (
+        subject: "${decodedJobName} - ${MESSAGE}",
+        body: '''${SCRIPT, template="groovy-html.template"}''',
+        to: "pradeep.singh@srijan.net",
+        replyTo: 'pradeep.singh@srijan.net',
+        attachLog: true
+    )
+}
+
+node {
+    try {
+        stage("INFORMATION") {
+            echo "Pipeline version: docker-ci.groovy-${SCRIPT_VERSION}"
+        }
+        // Static analysis via Trivy available with 0.9.0
+        // https://github.com/aquasecurity/trivy
+        stage("ScoutSuite") {
+            try {
+                // Shows only vulnerabilities which can be fixed, break if HIGH or above detected
+
+        sh "docker run -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY -e Default_region_name=$Default_region_name -v=$PWD:/report --rm scoutsuite:latest --provider aws
+
+
+            } catch(error) {
+                echo "TrivyScanRepo Scan needs attention"
+                // Inform of the error
+                notifyViaEmail(currentBuild.result, 'WARNING - TrivyScanRepo needs attention')
+                // Force success
+                // throw error
+                currentBuild.result = "SUCCESS"
+            }
+        }
+
+        //
+        // Before this point steps related to the git repository
+        //
+
+        stage('Certificate') {
+            addCertificate = false
+            try { addCertificate = ("$ADD_CERTIFICATE" == 'true') } catch (error) {addCertificate = false}
+
+            if(addCertificate) {
+                echo 'Certificate deployment'
+                withCredentials([
+                    file(credentialsId: "${CERTIFICATE_ID_AUTH}", variable: 'AUTH_FILE'),
+                    file(credentialsId: "${CERTIFICATE_ID_CERT}", variable: 'CERT_FILE'),
+                    file(credentialsId: "${CERTIFICATE_ID_KEY}", variable: 'KEY_FILE')
+                    file(credentialsId: "${CERTIFICATE_ID_AUTH}", variable: 'AUTH_FILE')
+                ]) {
+                    sh "mkdir -p $WORKSPACE/$CERTIFICATE_PATH"
+                    sh "cp -r $AUTH_FILE $WORKSPACE/$CERTIFICATE_PATH/ca.pem"
+                    sh "cp -r $CERT_FILE $WORKSPACE/$CERTIFICATE_PATH/cert.pem"
+                    sh "cp -r $KEY_FILE $WORKSPACE/$CERTIFICATE_PATH/key.pem"
+                     sh "cp -r $AUTH_FILE $WORKSPACE/$CERTIFICATE_PATH/ca.pem"
+                }
+            } else {
+                echo 'Certificate deployment n/a'
+            }
+
+        }
+
+        // Sonarqube scanner
+       // stage('Sonarqube Scan') {
+          try {
+            echo "Sonar scanning started ..."
+            try { INJECT_SONAR_TOKEN = ("$INJECT_SONAR_TOKEN" == 'true') } catch (error) {INJECT_SONAR_TOKEN = false}
+            if (INJECT_SONAR_TOKEN == true) {
+                withCredentials([string(credentialsId: 'oc-sonarqube-scanner-auth-secret-key', variable: 'SONAR_TOKEN')]) {
+                        sh """
+                            docker run --rm -e SONAR_HOST_URL='http://$SONAR_URL' \
+                            -v `pwd`:/usr/src sonarsource/sonar-scanner-cli \
+                            -Dsonar.login=$SONAR_TOKEN \
+                            -Dsonar.projectKey=$NAME \
+                            -Dsonar.sources=/usr/src \
+                            -Dsonar.projectVersion=$GIT_TAG_NAME
+                        """
+                }
+            } else {
+                echo "Sonarqube analysis not required."
+            }
+          } catch(error) {
+            echo "Unable to perform the Sonarqube analysis"
+            // Inform of the error
+            notifyViaEmail(currentBuild.result, 'WARNING - Sonarqube needs attention')
+            // Force success
+            // throw error
+            currentBuild.result = "SUCCESS"
+          }
+        }
+
+        // Build docker image
+        stage("Build") {
+            try {
+                // If tag define work with it, else fall back to PR
+
+                def INVOKE_DOCKER_BUILD = false
+                if ( "${ref_type}" == "tag" ) {
+                    INVOKE_DOCKER_BUILD = true;
+                    DOCKER_IMAGE_URI = "${IMAGE_URL}:${GIT_TAG_NAME}"
+                }
+
+                try { INJECT_GIT_PAT = ("$INJECT_GIT_PAT" == 'true') } catch (error) {INJECT_GIT_PAT = false}
+                if (INJECT_GIT_PAT == true) {
+                    withCredentials([usernamePassword(credentialsId: 'oc-ops-service-git-pat', passwordVariable: 'GIT_TOKEN', usernameVariable: 'GIT_USERNAME')]) {
+                        if ( INVOKE_DOCKER_BUILD ){
+                            sh "docker build --build-arg GIT_TOKEN=${GIT_TOKEN} -t ${DOCKER_IMAGE_URI} ."
+                        }
+                    }
+                } else {
+                    if ( INVOKE_DOCKER_BUILD ) {
+                        sh "docker build -t ${DOCKER_IMAGE_URI} ."
+                    }
+                }
+            } catch(error) {
+                echo "Unable to Build the Docker image"
+                throw error
+                currentBuild.result = "FAILURE"
+            }
+        }
+
+        stage('Post-build') {
+            removeCertificate = false
+            try { removeCertificate = ("$ADD_CERTIFICATE" == 'true') } catch (error) {removeCertificate = false}
+
+            if(removeCertificate) {
+                echo 'Certificate clear down'
+                sh "rm -f $WORKSPACE/$CERTIFICATE_PATH/ca.pem"
+                sh "rm -f $WORKSPACE/$CERTIFICATE_PATH/cert.pem"
+                sh "rm -f $WORKSPACE/$CERTIFICATE_PATH/key.pem"
+            } else {
+                echo 'Certificate clear down not required'
+            }
+
+        }
+
+        //
+        // After this point steps related to the image
+        //
+
+
+        // CVE vulnerabilites image scan
+        // https://github.com/aquasecurity/trivy
+     //   stage("TrivyScanImage") {
+            //try {
+                // Shows only vulnerabilities which can be fixed, break if HIGH or above detected
+                sh "docker run --rm \
+                                -v /var/lib/jenkins/workspace-trivy:/root/.cache/ \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                aquasec/trivy:0.9.1 --quiet \
+                                    image \
+                                    --no-progress  \
+                                    --ignore-unfixed \
+                                    --severity HIGH,CRITICAL \
+                                    --exit-code 1 \
+                                    ${DOCKER_IMAGE_URI}"
+            } //catch(error) {
+                echo "Trivy Scan failure"
+                // Inform of the error
+                notifyViaEmail(currentBuild.result, 'WARNING - Trivy needs attention')
+                // Force success
+                // throw error
+                currentBuild.result = "SUCCESS"
+            }
+        }
+
+        // Push to ECR
+       
+    } catch(error) {
+        currentBuild.result = "FAILURE"
+        throw error
+    }
+
+    finally {
+        notifyViaEmail(currentBuild.result, 'Report')
+    }
+}
